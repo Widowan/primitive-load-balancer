@@ -1,0 +1,19 @@
+plugins {
+    id 'java'
+    id 'application'
+}
+
+group 'dev.wido'
+version '1.0-SNAPSHOT'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'org.microhttp:microhttp:0.8'
+}
+
+application {
+    mainClass = 'dev.wido.Main'
+}
