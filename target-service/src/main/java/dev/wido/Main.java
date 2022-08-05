@@ -2,8 +2,7 @@ package dev.wido;
 
 import org.microhttp.*;
 
-import java.util.*;
-import java.util.concurrent.CompletableFuture;
+import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -47,33 +46,24 @@ public class Main {
             }
         };
 
-        var multiThreadedScheduledExecutor = Executors.newScheduledThreadPool(1);
-        var multiThreadedCachedExecutor = Executors.newFixedThreadPool(1);
         var currentRequests = new AtomicInteger(0);
 
-        Handler handler = (request, callback) -> {
-            logger.log(INFO, "Connection: " + request);
+        Handler handler = (request, callback) -> Thread.startVirtualThread(() -> {
             switch (request.uri()) {
                 case "/status" -> callback.accept(statusResponse);
                 case "/" -> {
                     currentRequests.getAndIncrement();
-                    CompletableFuture.runAsync(
-                            () -> {
-                                try {
-                                    Thread.sleep(2);
-                                } catch (InterruptedException e) {
-                                    throw new RuntimeException(e);
-                                }
-                                callback.accept(dataResponse);
-                            },
-                            multiThreadedCachedExecutor)
-                        .thenRun(currentRequests::decrementAndGet);
+                    try {
+                        Thread.sleep(15);
+                        callback.accept(dataResponse);
+                    } catch (InterruptedException e) { throw new RuntimeException(e); }
+                    currentRequests.decrementAndGet();
                 }
                 default -> callback.accept(notFoundResponse);
             }
-        };
+        });
 
-        multiThreadedScheduledExecutor.scheduleAtFixedRate(
+        Executors.newSingleThreadScheduledExecutor(Thread.ofVirtual().factory()).scheduleAtFixedRate(
             () -> logger.log(INFO, "Current connections: " + currentRequests.get()),
             10, 10, TimeUnit.SECONDS
         );

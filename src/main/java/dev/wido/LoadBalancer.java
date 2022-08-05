@@ -8,32 +8,43 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.HttpResponse.BodyHandlers;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionStage;
-import java.util.concurrent.ExecutorService;
+import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.Executors;
-import java.util.stream.IntStream;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 
-import static java.lang.System.Logger.Level.INFO;
+import static dev.wido.Utils.uncheckedLift;
 
 public class LoadBalancer {
     private final HttpClient httpClient = HttpClient.newHttpClient();
-    private final System.Logger logger = System.getLogger("Balancer");
 
+    @SuppressWarnings("OptionalGetWithoutIsPresent")
     public void run(List<String> targets) {
-        var checkAliveRequests = targets.stream()
+        var statusRequests = targets.stream()
             .map(t -> HttpRequest.newBuilder()
                 .uri(URI.create(t + "/status"))
                 .timeout(Duration.ofMillis(100))
                 .build())
             .toList();
 
-        var dataRequests = targets.stream()
-            .map(t -> HttpRequest.newBuilder()
-                .uri(URI.create(t + "/"))
-                .build())
-            .toList();
+        var dataRequestsMap = statusRequests.stream().collect(Collectors.toMap(
+            statusRequest -> statusRequest,
+            statusRequest -> HttpRequest.newBuilder()
+                .uri(uncheckedLift(() -> new URI(
+                        statusRequest.uri().getScheme(),
+                        null,
+                        statusRequest.uri().getHost(),
+                        statusRequest.uri().getPort(),
+                        null, null, null))
+                    .get())
+                .timeout(Duration.ofMillis(100))
+                .build()
+        ));
 
         var errorResponse = new Response(
             500,
@@ -53,21 +64,35 @@ public class LoadBalancer {
             }
         };
 
-        var multiThreadedCachedExecutor = Executors.newCachedThreadPool();
+        var aliveDataRequests = new AtomicReference<List<HttpRequest>>();
+        aliveDataRequests.set(List.of());
 
-        Handler handler = (request, callback) ->
-            anyOfIgnoreExceptions(getCheckAliveFutures(checkAliveRequests), multiThreadedCachedExecutor)
-            .thenCompose(r -> {
-                var nth = r.request().uri().getPort() % 10 - 1;
-                return httpClient.sendAsync(dataRequests.get(nth), BodyHandlers.ofString());
-            })
-            .thenAcceptAsync(r -> callback.accept(constructMicrohttpResponse(r)), multiThreadedCachedExecutor)
-            .whenComplete((r, ex) -> {
-                if (ex != null) {
-                    logger.log(INFO, "No alive targets");
-                    callback.accept(errorResponse);
-                }
-            });
+        var executor = Executors.newSingleThreadScheduledExecutor(Thread.ofVirtual().factory());
+        executor.scheduleAtFixedRate(
+            () -> aliveDataRequests.lazySet(getDataRequestsOfAliveTargets(statusRequests, dataRequestsMap)),
+            0, 1, TimeUnit.MILLISECONDS
+        );
+
+        var roundRobinCounter = new AtomicInteger(0);
+        Handler handler = (request, consumer) -> Thread.startVirtualThread(() -> {
+
+            var startTime = Instant.now();
+            while (Duration.between(startTime, Instant.now()).toSeconds() < 5) {
+                var adr = aliveDataRequests.get();
+                if (adr.size() == 0) continue;
+
+                var i = roundRobinCounter.getAndIncrement() % adr.size();
+                var req =
+                    uncheckedLift(() -> httpClient.send(adr.get(i), BodyHandlers.ofString()));
+                if (req.isEmpty() || req.get().statusCode() != 200) continue;
+
+                roundRobinCounter.getAndUpdate(rr -> rr % adr.size());
+                consumer.accept(constructMicrohttpResponse(req.get()));
+                return;
+            }
+
+            consumer.accept(errorResponse);
+        });
 
         try {
             var ev = new EventLoop(options, stubLogger, handler);
@@ -79,31 +104,17 @@ public class LoadBalancer {
 
     }
 
-    public List<CompletableFuture<HttpResponse<String>>> getCheckAliveFutures(List<HttpRequest> checkAliveRequests) {
-        return IntStream.range(0, checkAliveRequests.size())
-            .boxed()
-            .map(i -> httpClient.sendAsync(checkAliveRequests.get(i), BodyHandlers.ofString()))
-            .toList();
-    }
-
-    // https://stackoverflow.com/questions/33913193/completablefuture-waiting-for-first-one-normally-return
-    @SuppressWarnings("SuspiciousToArrayCall")
-    public static <T> CompletableFuture<T> anyOfIgnoreExceptions(
-            List<? extends CompletionStage<? extends T>> l,
-            ExecutorService exec)
+    public List<HttpRequest> getDataRequestsOfAliveTargets(
+        List<HttpRequest> aliveRequests, Map<HttpRequest, HttpRequest> dataRequests)
     {
-        CompletableFuture<T> f = new CompletableFuture<>();
-        CompletableFuture.allOf(
-                    l.stream()
-                    .map(s -> s.thenAcceptAsync(f::complete, exec))
-                    .toArray(CompletableFuture<?>[]::new))
-            // allOf's exceptionally handler is only called
-            // if there was no successful completion already
-            .exceptionally(ex -> {
-                f.completeExceptionally(ex);
-                return null;
-            });
-        return f;
+        return aliveRequests.stream()
+            .map(httpRequest -> uncheckedLift(() -> httpClient.send(httpRequest, BodyHandlers.ofString())))
+            .filter(Optional::isPresent)
+            .map(Optional::get)
+            .filter(r -> r.statusCode() == 200)
+            .map(HttpResponse::request)
+            .map(dataRequests::get)
+            .toList();
     }
 
     public Response constructMicrohttpResponse(HttpResponse<String> r) {
